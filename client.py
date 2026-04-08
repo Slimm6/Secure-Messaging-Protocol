@@ -1,3 +1,5 @@
+import os
+import time
 import argparse
 import socket
 import threading
@@ -10,6 +12,11 @@ from argon2.low_level import hash_secret, Type
 from hkdf import hkdf_expand, hkdf_extract
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidSignature
 
 # SRP-6a parameters (same as server)
 n = int("""
