@@ -1,16 +1,23 @@
-"""
-Secure Messaging Protocol - Server
-Handles discovery, authentication, and peer connection facilitation
-"""
-
 import argparse
 import socket
 import threading
 import json
 import hashlib
 from typing import Dict, Tuple, Optional
-import argon2
+import secrets
+import hmac
+import time
+from hkdf import hkdf_expand, hkdf_extract
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 
+n = int("""
+    EEAF0AB9ADB38DD69C33F80AFA8FC5E86072618775FF3C0B9EA2314C
+    60756745D262E1B0E824D418D00000000000000000000000000000000
+    EEAF0AB9ADB38DD69C33F80AFA8FC5E86072618775FF3C0B9EA2314C
+    """.replace('\n', '').replace(' ', ''), 16)
+g = 2
+k = int(hashlib.sha256(f"{n}{g}".encode()).hexdigest(), 16)
 
 class Server:
     def __init__(self, host, port):
@@ -19,7 +26,14 @@ class Server:
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.host, self.port))
-        self.clients: Dict[str, Tuple[str, int]] = {}
+        self.users = {}
+        self.clients = {}
+        self.sessions: Dict[str, str] = {}
+        self.privkey = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        self.pubkey = self.privkey.public_key()
         self.lock = threading.Lock()
     
     def run(self):
@@ -46,63 +60,114 @@ class Server:
         with self.lock:
             self.clients.clear()
         self.sock.close()
+
+    def register(self, message, addr):
+        username = message.get('username')
+        verifier = int(message.get('verifier'))
+        salt = message.get('salt')
+        with self.lock:
+            if username in self.users:
+                response = {'type': 'REGISTER-RESP', 'success': False, 'message': 'Username already exists'}
+            else:
+                self.users[username] = {'verifier': verifier, 'salt': salt}
+                response = {'type': 'REGISTER-RESP', 'success': True, 'message': 'Registration successful'}
+        self.sock.sendto(json.dumps(response).encode(), addr)
+
         
-    def authenticate(self, username: str, password: str):
-        """Authenticate client using PAKE (Password-Authenticated Key Exchange)"""
-        pass
-    
-    def register(self, username: str, password: str):
-        """Register new client with username and password"""
-        pass
-    
-    def verifier(self, password: str):
-        """
-        Generate Argon2id password verifier and salt
-        """
-        pass
-        
-    def register_client(self, username: str, ip: str, port: int) -> bool:
-        """Register client's IP:Port endpoint after authentication"""
-        pass
-    
-    def get_client(self, username: str):
-        """Retrieve client information by username"""
-        pass
+    def authenticate(self, packet, addr):
+        username = packet.get('username')
+        step = packet.get('step', 1)
+        with self.lock:
+            if username not in self.users:
+                response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'User not found'}
+                self.sock.sendto(json.dumps(response).encode(), addr)
+                return
+            user = self.users[username]
+            verifier = user['verifier']
+            salt = user['salt']
+            if step == 1:
+                client_public_A = int(packet.get('A'))                
+                b = secrets.randbelow(n)
+                server_public_B = (k * verifier + pow(g, b, n)) % n                
+                self.clients[username] = {
+                    'b': b,
+                    'A': client_public_A,
+                    'B': server_public_B,
+                    'verifier': verifier,
+                    'addr': addr
+                }                
+                response = {
+                    'type': 'SIGN-IN-RESP',
+                    'step': 2,
+                    'salt': salt,
+                    'B': str(server_public_B)
+                }
+                self.sock.sendto(json.dumps(response).encode(), addr)
+            elif step == 2:
+                proof = packet.get('proof')
+                if username not in self.clients:
+                    response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication session expired'}
+                    self.sock.sendto(json.dumps(response).encode(), addr)
+                    return
+                session = self.clients[username]
+                A = session['A']
+                B = session['B']
+                u = int(hashlib.sha256(f"{A}{B}".encode()).hexdigest(), 16)
+                server_secret = pow(A * pow(verifier, u, n), session['b'], n) % n                
+                salt_bytes = bytes.fromhex(salt)
+                prk = hkdf_extract(salt_bytes, server_secret.to_bytes(256, 'big'), hashlib.sha256)
+                K = hkdf_expand(prk, b'', 32, hashlib.sha256)                
+                expected = hmac.new(K, (str(A) + str(B)).encode(), hashlib.sha256).hexdigest()
+                if proof == expected:
+                    client_pubkey = packet.get('pubkey')                    
+                    self.clients[username] = {'ip': addr[0], 'port': addr[1]} 
+                    print(f"Client {username} registered: {addr[0]}:{addr[1]}")                 
+                    proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()                    
+                    timestamp = int(time.time())
+                    payload = json.dumps({
+                        'username': username,
+                        'pubkey': client_pubkey,
+                        'timestamp': timestamp
+                    }).encode()                    
+                    signature = self.privkey.sign(payload,
+                        padding.PSS(
+                            mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.MAX_LENGTH
+                        ),
+                        hashes.SHA256()
+                    )
+                    token = {'payload': payload.decode(),'signature': signature.hex()}
+                    self.sessions[username] = token
+                    response = {
+                        'type': 'SIGN-IN-RESP',
+                        'success': True,
+                        'proof': proof,
+                        'token': token,
+                        'message': 'Authentication successful'
+                    }
+                else:
+                    response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
+                self.sock.sendto(json.dumps(response).encode(), addr)
     
     def list(self):
-        """Get list of all online clients"""
         pass
     
     def signout(self, username: str):
-        """Remove client from registry (client went offline)"""
         pass
         
-    def query(self, requester: str, target_username: str):
-        """
-        Discover peer information for connection establishment
-        """
-        pass
-        
-    def parse_request(self, data: str) -> Dict:
-        """Parse incoming JSON request"""
-        pass
-    
-    def send_response(self, client_socket: socket.socket, response: Dict):
-        """Send JSON response to client"""
+    def query(self, requester, username):
         pass
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-h', type=int, required=True, help='Host Address')
-    parser.add_argument('-sp', type=int, required=True, help='Port')
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument('--host', type=str, default='localhost', help='Host Address')
+    parser.add_argument('--port', type=int, required=True, help='Port')
     args = parser.parse_args()
-    server = Server(args.sp)
+    server = Server(args.host, args.port)
     try:
         server.run()
     except KeyboardInterrupt:
-        print("\nShutting down server...")
         server.stop()
     except Exception as e:
-        print(f"Server error: {e}")
         server.stop()
 
