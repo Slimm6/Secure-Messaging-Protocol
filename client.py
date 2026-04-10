@@ -68,6 +68,10 @@ class Client:
                         self.list()
                     elif command == 'send':
                         self.message(parts[1], parts[2])
+                    elif command == 'signout':
+                        self.signout()
+                        self.sock.close()
+                        break
                     else:
                         print(f"Unknown command: '{command}'")
                 except KeyboardInterrupt:
@@ -246,7 +250,15 @@ class Client:
             return False
 
     def list(self):
-            pass
+        packet = {
+            'type': 'LIST',
+            'token': self.session_token
+        }
+        response = self.send(packet)
+        if response and response.get('success'):
+            return response
+        print(f"list fail: {response.get('message') if response else 'no response'}")
+        return None
 
     def query(self, username):
         packet = {
@@ -503,12 +515,10 @@ class Client:
         peer_addr = (session['ip'], session['port'])
         with self.lock:
             self.peer_sessions[username] = key
-
         nonce = secrets.token_bytes(12)
         ciphertext = AESGCM(key).encrypt(nonce, message.encode(), None)
         mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).hexdigest()
         seq = int(time.time())
-
         packet = {
             'type': 'MESSAGE',
             'from': self.username,
@@ -521,8 +531,16 @@ class Client:
         print(f"Message sent to {username}")
 
     def signout(self):
-        pass
-
+        packet = {
+            'type': 'SIGNOUT',
+            'token': self.session_token,
+            'username': self.username
+        }
+        response = self.send(packet)
+        if response and response.get('success'):
+            return response
+        print(f"signout fail: {response.get('message') if response else 'no response'}")
+        return None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -531,10 +549,8 @@ if __name__ == "__main__":
     parser.add_argument('--host', type=str, required=True, help='Server host')
     parser.add_argument('--port', type=int, required=True, help='Server port')
     args = parser.parse_args()
-
     with open('server_pubkey.pem', 'rb') as f:
         server_pubkey = serialization.load_pem_public_key(f.read())
-
     client = Client(args.username, args.host, args.port, server_pubkey=server_pubkey)
     if args.register:
         password = input("Enter password for registration: ")

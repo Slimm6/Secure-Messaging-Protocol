@@ -51,6 +51,8 @@ class Server:
                         self.list(addr)
                     elif type == 'QUERY':
                         self.query(packet, addr)
+                    elif type == 'SIGNOUT':
+                        self.signout(packet, packet.get('username'), addr)
                 except Exception as e:
                     print(f"Error from {addr}: {e}")
         except KeyboardInterrupt:
@@ -149,10 +151,57 @@ class Server:
                     response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
                 self.sock.sendto(json.dumps(response).encode(), addr)
 
-    def list(self, addr):
-        pass
+    def list(self, packet, addr):
+        token = packet.get('token')
+        try:
+            payload = token['payload'].encode()
+            sig = bytes.fromhex(token['signature'])
+            self.pubkey.verify(
+                sig,
+                payload,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        except Exception:
+            self.sock.sendto(json.dumps({'type': 'LIST-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+            return
+        with self.lock:
+            response = {
+                'type': 'LIST-RESP',
+                'success': True,
+                'list': list(self.clients.keys())
+            }
+            self.sock.sendto(json.dumps(response).encode(), addr)
 
-    def signout(self, username: str):
+    def signout(self, packet, username, addr):
+        token = packet.get('token')
+        try:
+            payload = token['payload'].encode()
+            sig = bytes.fromhex(token['signature'])
+            self.pubkey.verify(
+                sig,
+                payload,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        except Exception:
+            self.sock.sendto(json.dumps({'type': 'SIGNOUT-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+            return
+        with self.lock:
+            if username in self.clients:
+                del self.clients[username]
+                del self.sessions[username]
+            response = {
+                'type': 'SIGNOUT-RESP',
+                'success': True,
+            }
+            self.sock.sendto(json.dumps(response).encode(), addr)
         pass
 
     def query(self, packet, addr):
