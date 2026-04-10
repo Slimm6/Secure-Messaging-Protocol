@@ -159,20 +159,7 @@ class Server:
                     self.clients[username] = {'ip': addr[0], 'port': peer_port}
                     print(f"Client {username} registered: {addr[0]}:{peer_port}")
                     proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()
-                    timestamp = int(time.time())
-                    payload = json.dumps({
-                        'username': username,
-                        'pubkey': client_pubkey,
-                        'timestamp': timestamp
-                    }).encode()
-                    signature = self.privkey.sign(payload,
-                        padding.PSS(
-                            mgf=padding.MGF1(hashes.SHA256()),
-                            salt_length=padding.PSS.MAX_LENGTH
-                        ),
-                        hashes.SHA256()
-                    )
-                    token = {'payload': payload.decode(), 'signature': signature.hex()}
+                    token = self.create_token(username, client_pubkey)
                     self.sessions[username] = token
                     response = {
                         'type': 'SIGN-IN-RESP',
@@ -185,8 +172,25 @@ class Server:
                     response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
                 self.sock.sendto(json.dumps(response).encode(), addr)
 
-    def list(self, packet, addr):
-        token = packet.get('token')
+    def create_token(self, username, client_pubkey):
+        """Create a fresh token with current timestamp"""
+        timestamp = int(time.time())
+        payload = json.dumps({
+            'username': username,
+            'pubkey': client_pubkey,
+            'timestamp': timestamp
+        }).encode()
+        signature = self.privkey.sign(payload,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return {'payload': payload.decode(), 'signature': signature.hex()}
+
+    def verify_token_not_expired(self, token):
+        """Verify token signature and check if not expired. Returns (is_valid, payload_dict)"""
         try:
             payload = token['payload'].encode()
             sig = bytes.fromhex(token['signature'])
@@ -199,75 +203,73 @@ class Server:
                 ),
                 hashes.SHA256()
             )
+            data = json.loads(payload)
+            if int(time.time()) - data['timestamp'] > 3600:
+                return False, None
+            return True, data
         except Exception:
-            self.sock.sendto(json.dumps({'type': 'LIST-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+            return False, None
+
+    def list(self, packet, addr):
+        token = packet.get('token')
+        is_valid, token_data = self.verify_token_not_expired(token)
+        if not is_valid:
+            self.sock.sendto(json.dumps({'type': 'LIST-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
+        username = token_data.get('username')
         with self.lock:
+            client_pubkey = token_data.get('pubkey')
+            new_token = self.create_token(username, client_pubkey)
+            self.sessions[username] = new_token
             response = {
                 'type': 'LIST-RESP',
                 'success': True,
-                'list': list(self.clients.keys())
+                'list': list(self.clients.keys()),
+                'token': new_token
             }
             self.sock.sendto(json.dumps(response).encode(), addr)
 
     def signout(self, packet, username, addr):
         token = packet.get('token')
-        try:
-            payload = token['payload'].encode()
-            sig = bytes.fromhex(token['signature'])
-            self.pubkey.verify(
-                sig,
-                payload,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-        except Exception:
-            self.sock.sendto(json.dumps({'type': 'SIGNOUT-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+        is_valid, token_data = self.verify_token_not_expired(token)
+        if not is_valid:
+            self.sock.sendto(json.dumps({'type': 'SIGNOUT-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
         with self.lock:
             if username in self.clients:
                 del self.clients[username]
+            if username in self.sessions:
                 del self.sessions[username]
             response = {
                 'type': 'SIGNOUT-RESP',
                 'success': True,
             }
             self.sock.sendto(json.dumps(response).encode(), addr)
-        pass
 
     def query(self, packet, addr):
         token = packet.get('token')
         target = packet.get('target')
-        try:
-            payload = token['payload'].encode()
-            sig = bytes.fromhex(token['signature'])
-            self.pubkey.verify(
-                sig,
-                payload,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-        except Exception:
-            self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+        is_valid, token_data = self.verify_token_not_expired(token)
+        if not is_valid:
+            self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
+        username = token_data.get('username')
         with self.lock:
             if target not in self.clients:
                 self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'user not online'}).encode(), addr)
                 return
             peer = self.clients[target]
             peer_token = self.sessions.get(target)
+            client_pubkey = token_data.get('pubkey')
+            new_token = self.create_token(username, client_pubkey)
+            self.sessions[username] = new_token
         response = {
             'type': 'QUERY-RESP',
             'success': True,
             'ip': peer['ip'],
             'port': peer['port'],
-            'token': peer_token
+            'token': peer_token,
+            'new_token': new_token
         }
         self.sock.sendto(json.dumps(response).encode(), addr)
 
