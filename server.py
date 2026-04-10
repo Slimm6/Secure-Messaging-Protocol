@@ -7,6 +7,7 @@ from typing import Dict, Tuple, Optional
 import secrets
 import hmac
 import time
+import os
 from hkdf import hkdf_expand, hkdf_extract
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -26,7 +27,9 @@ class Server:
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.host, self.port))
+        self.users_file = 'users.json'
         self.users = {}
+        self.load_users()
         self.clients = {}
         self.sessions: Dict[str, str] = {}
         self.privkey = rsa.generate_private_key(
@@ -45,10 +48,10 @@ class Server:
                     type = packet.get('type')
                     if type == 'REGISTER':
                         self.register(packet, addr)
-                    if type == 'SIGN-IN':
+                    elif type == 'SIGN-IN':
                         self.authenticate(packet, addr)
                     elif type == 'LIST':
-                        self.list(addr)
+                        self.list(packet, addr)
                     elif type == 'QUERY':
                         self.query(packet, addr)
                     elif type == 'SIGNOUT':
@@ -61,19 +64,50 @@ class Server:
     def stop(self):
         with self.lock:
             self.clients.clear()
+            self.sessions.clear()
+            self.save_users()
         self.sock.close()
+
+    def load_users(self):
+        """Load users from file if it exists"""
+        if os.path.exists(self.users_file):
+            try:
+                with open(self.users_file, 'r') as f:
+                    self.users = json.load(f)
+                print(f"Loaded {len(self.users)} users from {self.users_file}")
+            except Exception as e:
+                print(f"Error loading users from file: {e}")
+                self.users = {}
+        else:
+            self.users = {}
+
+    def save_users(self):
+        """Save users to file (must be called with lock held)"""
+        try:
+            with open(self.users_file, 'w') as f:
+                json.dump(self.users, f, indent=2)
+            print(f"Saved {len(self.users)} users to {self.users_file}")
+        except Exception as e:
+            print(f"Error saving users to file: {e}")
 
     def register(self, message, addr):
         username = message.get('username')
         verifier = int(message.get('verifier'))
         salt = message.get('salt')
+        print(f"[REGISTER] Received register request from {addr} for user: {username}")
         with self.lock:
             if username in self.users:
                 response = {'type': 'REGISTER-RESP', 'success': False, 'message': 'Username already exists'}
+                print(f"[REGISTER] User {username} already exists")
             else:
                 self.users[username] = {'verifier': verifier, 'salt': salt}
+                print(f"[REGISTER] Saving user {username} to file...")
+                self.save_users()
                 response = {'type': 'REGISTER-RESP', 'success': True, 'message': 'Registration successful'}
+                print(f"[REGISTER] User {username} registered successfully")
+        print(f"[REGISTER] Sending response to {addr}: {response}")
         self.sock.sendto(json.dumps(response).encode(), addr)
+        print(f"[REGISTER] Response sent")
 
     def authenticate(self, packet, addr):
         username = packet.get('username')
