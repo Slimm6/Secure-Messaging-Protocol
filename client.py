@@ -53,7 +53,8 @@ class Client:
         self.lock = threading.Lock()
         self.A = None
         self.server_B = None
-        self.peer_sessions: Dict[str, bytes] = {} 
+        self.peer_sessions = {}
+        self.seq_tracker = {}
 
     def run(self):
         threading.Thread(target=self.listen, daemon=True).start()
@@ -96,10 +97,11 @@ class Client:
                     ptype = packet.get('type')
                     if ptype == 'MESSAGE':
                         sender = packet.get('from')
+                        seq_no = packet.get('seq')
                         with self.lock:
                             key = self.peer_sessions.get(sender)
-                        if key is None:
-                            print(f"\nMessage from {sender} but no session key, dropping")
+                            last_seq = self.seq_tracker.get(sender, -1)
+                        if key is None or seq_no is None or seq_no <= last_seq:
                             print("+> ", end='', flush=True)
                         else:
                             try:
@@ -108,6 +110,8 @@ class Client:
                                     print(f"\nMessage from {sender} failed HMAC, dropping")
                                 else:
                                     plaintext = AESGCM(key).decrypt(bytes.fromhex(packet['nonce']), bytes.fromhex(packet['ciphertext']), None)
+                                    with self.lock:
+                                        self.seq_tracker[sender] = seq_no
                                     print(f"\n<– <From {sender}>: {plaintext.decode()}")
                             except Exception as e:
                                 print(f"\nFailed to decrypt message from {sender}: {e}")
@@ -150,24 +154,24 @@ class Client:
             return False
 
     def login(self, password):
-        step1_response = self.signin(password)
-        if not step1_response:
+        step1 = self.signin(password)
+        if not step1:
             print("Login failed: No response from server")
             return False
-        step2_response = self.send_hmac(password, step1_response)
-        if not step2_response:
+        step2 = self.send_hmac(password, step1)
+        if not step2:
             print("Login failed: HMAC error")
             return False
-        if step2_response.get('success'):
-            server_proof = step2_response.get('proof')
-            if not self.verify(server_proof, self.session_key):
+        if step2.get('success'):
+            proof = step2.get('proof')
+            if not self.verify(proof, self.session_key):
                 print("Login failed: verification failed")
                 return False
-            self.session_token = step2_response.get('token')
+            self.session_token = step2.get('token')
             print("Authentication successful!")
             return True
         else:
-            print(f"Login failed: {step2_response.get('message', 'Unknown error')}")
+            print(f"Login failed: {step2.get('message', 'Unknown error')}")
             return False
 
     def send(self, packet: Dict):

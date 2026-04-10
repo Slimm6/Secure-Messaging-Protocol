@@ -69,12 +69,10 @@ class Server:
         self.sock.close()
 
     def load_users(self):
-        """Load users from file if it exists"""
         if os.path.exists(self.users_file):
             try:
                 with open(self.users_file, 'r') as f:
                     self.users = json.load(f)
-                print(f"Loaded {len(self.users)} users from {self.users_file}")
             except Exception as e:
                 print(f"Error loading users from file: {e}")
                 self.users = {}
@@ -82,11 +80,9 @@ class Server:
             self.users = {}
 
     def save_users(self):
-        """Save users to file (must be called with lock held)"""
         try:
             with open(self.users_file, 'w') as f:
                 json.dump(self.users, f, indent=2)
-            print(f"Saved {len(self.users)} users to {self.users_file}")
         except Exception as e:
             print(f"Error saving users to file: {e}")
 
@@ -94,20 +90,14 @@ class Server:
         username = message.get('username')
         verifier = int(message.get('verifier'))
         salt = message.get('salt')
-        print(f"[REGISTER] Received register request from {addr} for user: {username}")
         with self.lock:
             if username in self.users:
                 response = {'type': 'REGISTER-RESP', 'success': False, 'message': 'Username already exists'}
-                print(f"[REGISTER] User {username} already exists")
             else:
                 self.users[username] = {'verifier': verifier, 'salt': salt}
-                print(f"[REGISTER] Saving user {username} to file...")
                 self.save_users()
                 response = {'type': 'REGISTER-RESP', 'success': True, 'message': 'Registration successful'}
-                print(f"[REGISTER] User {username} registered successfully")
-        print(f"[REGISTER] Sending response to {addr}: {response}")
         self.sock.sendto(json.dumps(response).encode(), addr)
-        print(f"[REGISTER] Response sent")
 
     def authenticate(self, packet, addr):
         username = packet.get('username')
@@ -173,7 +163,6 @@ class Server:
                 self.sock.sendto(json.dumps(response).encode(), addr)
 
     def create_token(self, username, client_pubkey):
-        """Create a fresh token with current timestamp"""
         timestamp = int(time.time())
         payload = json.dumps({
             'username': username,
@@ -189,8 +178,7 @@ class Server:
         )
         return {'payload': payload.decode(), 'signature': signature.hex()}
 
-    def verify_token_not_expired(self, token):
-        """Verify token signature and check if not expired. Returns (is_valid, payload_dict)"""
+    def verify_token(self, token):
         try:
             payload = token['payload'].encode()
             sig = bytes.fromhex(token['signature'])
@@ -212,7 +200,7 @@ class Server:
 
     def list(self, packet, addr):
         token = packet.get('token')
-        is_valid, token_data = self.verify_token_not_expired(token)
+        is_valid, token_data = self.verify_token(token)
         if not is_valid:
             self.sock.sendto(json.dumps({'type': 'LIST-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
@@ -231,7 +219,7 @@ class Server:
 
     def signout(self, packet, username, addr):
         token = packet.get('token')
-        is_valid, token_data = self.verify_token_not_expired(token)
+        is_valid, token_data = self.verify_token(token)
         if not is_valid:
             self.sock.sendto(json.dumps({'type': 'SIGNOUT-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
@@ -249,7 +237,7 @@ class Server:
     def query(self, packet, addr):
         token = packet.get('token')
         target = packet.get('target')
-        is_valid, token_data = self.verify_token_not_expired(token)
+        is_valid, token_data = self.verify_token(token)
         if not is_valid:
             self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
