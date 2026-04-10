@@ -35,7 +35,7 @@ class Server:
         )
         self.pubkey = self.privkey.public_key()
         self.lock = threading.Lock()
-    
+
     def run(self):
         try:
             while True:
@@ -55,7 +55,7 @@ class Server:
                     print(f"Error from {addr}: {e}")
         except KeyboardInterrupt:
             self.stop()
-    
+
     def stop(self):
         with self.lock:
             self.clients.clear()
@@ -73,7 +73,6 @@ class Server:
                 response = {'type': 'REGISTER-RESP', 'success': True, 'message': 'Registration successful'}
         self.sock.sendto(json.dumps(response).encode(), addr)
 
-        
     def authenticate(self, packet, addr):
         username = packet.get('username')
         step = packet.get('step', 1)
@@ -86,16 +85,16 @@ class Server:
             verifier = user['verifier']
             salt = user['salt']
             if step == 1:
-                client_public_A = int(packet.get('A'))                
+                client_public_A = int(packet.get('A'))
                 b = secrets.randbelow(n)
-                server_public_B = (k * verifier + pow(g, b, n)) % n                
+                server_public_B = (k * verifier + pow(g, b, n)) % n
                 self.clients[username] = {
                     'b': b,
                     'A': client_public_A,
                     'B': server_public_B,
                     'verifier': verifier,
                     'addr': addr
-                }                
+                }
                 response = {
                     'type': 'SIGN-IN-RESP',
                     'step': 2,
@@ -113,22 +112,23 @@ class Server:
                 A = session['A']
                 B = session['B']
                 u = int(hashlib.sha256(f"{A}{B}".encode()).hexdigest(), 16)
-                server_secret = pow(A * pow(verifier, u, n), session['b'], n) % n                
+                server_secret = pow(A * pow(verifier, u, n), session['b'], n) % n
                 salt_bytes = bytes.fromhex(salt)
                 prk = hkdf_extract(salt_bytes, server_secret.to_bytes(256, 'big'), hashlib.sha256)
-                K = hkdf_expand(prk, b'', 32, hashlib.sha256)                
+                K = hkdf_expand(prk, b'', 32, hashlib.sha256)
                 expected = hmac.new(K, (str(A) + str(B)).encode(), hashlib.sha256).hexdigest()
                 if proof == expected:
-                    client_pubkey = packet.get('pubkey')                    
-                    self.clients[username] = {'ip': addr[0], 'port': addr[1]} 
-                    print(f"Client {username} registered: {addr[0]}:{addr[1]}")                 
-                    proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()                    
+                    client_pubkey = packet.get('pubkey')
+                    peer_port = packet.get('peer_port', addr[1])
+                    self.clients[username] = {'ip': addr[0], 'port': peer_port}
+                    print(f"Client {username} registered: {addr[0]}:{peer_port}")
+                    proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()
                     timestamp = int(time.time())
                     payload = json.dumps({
                         'username': username,
                         'pubkey': client_pubkey,
                         'timestamp': timestamp
-                    }).encode()                    
+                    }).encode()
                     signature = self.privkey.sign(payload,
                         padding.PSS(
                             mgf=padding.MGF1(hashes.SHA256()),
@@ -136,7 +136,7 @@ class Server:
                         ),
                         hashes.SHA256()
                     )
-                    token = {'payload': payload.decode(),'signature': signature.hex()}
+                    token = {'payload': payload.decode(), 'signature': signature.hex()}
                     self.sessions[username] = token
                     response = {
                         'type': 'SIGN-IN-RESP',
@@ -148,15 +148,46 @@ class Server:
                 else:
                     response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
                 self.sock.sendto(json.dumps(response).encode(), addr)
-    
-    def list(self):
+
+    def list(self, addr):
         pass
-    
+
     def signout(self, username: str):
         pass
-        
-    def query(self, requester, username):
-        pass
+
+    def query(self, packet, addr):
+        token = packet.get('token')
+        target = packet.get('target')
+        try:
+            payload = token['payload'].encode()
+            sig = bytes.fromhex(token['signature'])
+            self.pubkey.verify(
+                sig,
+                payload,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        except Exception:
+            self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'invalid token'}).encode(), addr)
+            return
+        with self.lock:
+            if target not in self.clients:
+                self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'user not online'}).encode(), addr)
+                return
+            peer = self.clients[target]
+            peer_token = self.sessions.get(target)
+        response = {
+            'type': 'QUERY-RESP',
+            'success': True,
+            'ip': peer['ip'],
+            'port': peer['port'],
+            'token': peer_token
+        }
+        self.sock.sendto(json.dumps(response).encode(), addr)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(add_help=True)
@@ -164,10 +195,18 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, required=True, help='Port')
     args = parser.parse_args()
     server = Server(args.host, args.port)
+
+    pubkey_pem = server.pubkey.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    with open('server_pubkey.pem', 'wb') as f:
+        f.write(pubkey_pem)
+    print("Server pubkey written to server_pubkey.pem")
+
     try:
         server.run()
     except KeyboardInterrupt:
         server.stop()
     except Exception as e:
         server.stop()
-
