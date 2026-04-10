@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
 # SRP-6a parameters (same as server)
@@ -29,7 +30,7 @@ k = int(hashlib.sha256(f"{n}{g}".encode()).hexdigest(), 16)
 
 
 class Client:
-    def __init__(self, username: str, server_host: str, server_port: int):
+    def __init__(self, username: str, server_host: str, server_port: int, server_pubkey=None):
         self.username = username
         self.host = server_host
         self.port = server_port
@@ -44,13 +45,15 @@ class Client:
         self.pubkey_pem = self.pubkey.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode()        
+        ).decode()
         self.session_token = None
         self.session_key = None
+        self.server_pubkey = server_pubkey
         self.lock = threading.Lock()
         self.A = None
         self.server_B = None
-    
+        self.peer_sessions: Dict[str, bytes] = {} 
+
     def run(self):
         threading.Thread(target=self.listen, daemon=True).start()
         try:
@@ -80,18 +83,38 @@ class Client:
                 data, addr = self.peer.recvfrom(65535)
                 try:
                     packet = json.loads(data.decode('utf-8'))
-                    if packet.get('type') == 'MESSAGE':
+                    ptype = packet.get('type')
+                    if ptype == 'MESSAGE':
                         sender = packet.get('from')
-                        message = packet.get('message')
-                        print(f"\n<– <From {addr[0]}:{addr[1]}:{sender}>: {message}")
-                        print("+> ", end='', flush=True)
+                        with self.lock:
+                            key = self.peer_sessions.get(sender)
+                        if key is None:
+                            print(f"\nMessage from {sender} but no session key, dropping")
+                            print("+> ", end='', flush=True)
+                        else:
+                            try:
+                                expected_mac = hmac.new(key, bytes.fromhex(packet['nonce']) + bytes.fromhex(packet['ciphertext']), hashlib.sha256).hexdigest()
+                                if not hmac.compare_digest(expected_mac, packet['mac']):
+                                    print(f"\nMessage from {sender} failed HMAC, dropping")
+                                else:
+                                    plaintext = AESGCM(key).decrypt(bytes.fromhex(packet['nonce']), bytes.fromhex(packet['ciphertext']), None)
+                                    print(f"\n<– <From {sender}>: {plaintext.decode()}")
+                            except Exception as e:
+                                print(f"\nFailed to decrypt message from {sender}: {e}")
+                            print("+> ", end='', flush=True)
+                    elif ptype == 'KEY-INIT':
+                        threading.Thread(target=self.handle_key_init, args=(packet, addr), daemon=True).start()
+                    else:
+                        pass
+                        # print(f"\nlisten() discarding unexpected type={ptype} from {addr}", flush=True)
                 except json.JSONDecodeError:
                     print(f"Invalid message from {addr}")
-            except:
+            except Exception as e:
+                print(f"\nlisten() exception: {e}", flush=True)
                 break
-    
+
     def register(self, password):
-        salt = secrets.token_hex(16)        
+        salt = secrets.token_hex(16)
         hash = hash_secret(
             password.encode(),
             bytes.fromhex(salt),
@@ -102,8 +125,8 @@ class Client:
             type=Type.ID
         )
         prk = hkdf_extract(bytes.fromhex(salt), hash, hashlib.sha256)
-        x = int.from_bytes(hkdf_expand(prk, b'', 32, hashlib.sha256), byteorder='big')        
-        verifier = pow(g, x, n)        
+        x = int.from_bytes(hkdf_expand(prk, b'', 32, hashlib.sha256), byteorder='big')
+        verifier = pow(g, x, n)
         packet = {
             'type': 'REGISTER',
             'username': self.username,
@@ -116,12 +139,12 @@ class Client:
             return True
         else:
             return False
-    
+
     def login(self, password):
         step1_response = self.signin(password)
         if not step1_response:
             print("Login failed: No response from server")
-            return False        
+            return False
         step2_response = self.send_hmac(password, step1_response)
         if not step2_response:
             print("Login failed: HMAC error")
@@ -130,14 +153,14 @@ class Client:
             server_proof = step2_response.get('proof')
             if not self.verify(server_proof, self.session_key):
                 print("Login failed: verification failed")
-                return False            
+                return False
             self.session_token = step2_response.get('token')
             print("Authentication successful!")
             return True
         else:
             print(f"Login failed: {step2_response.get('message', 'Unknown error')}")
             return False
-    
+
     def send(self, packet: Dict):
         try:
             self.sock.sendto(json.dumps(packet).encode(), (self.host, self.port))
@@ -151,10 +174,10 @@ class Client:
         except Exception as e:
             print(f"Error communicating with server: {e}")
             return None
-    
+
     def signin(self, password):
         self.a = secrets.randbelow(n)
-        self.A = pow(g, self.a, n)         
+        self.A = pow(g, self.a, n)
         packet = {
             'type': 'SIGN-IN',
             'username': self.username,
@@ -165,7 +188,7 @@ class Client:
         if response and response.get('step') == 2:
             return response
         return None
-    
+
     def send_hmac(self, password: str, response: Dict):
         salt = response.get('salt')
         self.B_server = int(response.get('B'))
@@ -179,42 +202,324 @@ class Client:
             type=Type.ID
         )
         prk = hkdf_extract(bytes.fromhex(salt), hash, hashlib.sha256)
-        x = int.from_bytes(hkdf_expand(prk, b'', 32, hashlib.sha256), byteorder='big')        
+        x = int.from_bytes(hkdf_expand(prk, b'', 32, hashlib.sha256), byteorder='big')
         u = int(hashlib.sha256(f"{self.A}{self.B_server}".encode()).hexdigest(), 16)
         kgx = (k * pow(g, x, n)) % n
         kgx = (self.B_server - kgx) % n
-        secret = pow(kgx, self.a + u * x, n) % n        
+        secret = pow(kgx, self.a + u * x, n) % n
         prk = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
-        K = hkdf_expand(prk, b'', 32, hashlib.sha256)        
-        self.session_key = K        
-        proof = hmac.new(K, (str(self.A) + str(self.B_server)).encode(), hashlib.sha256).hexdigest()        
-        packet = {'type': 'SIGN-IN', 'username': self.username,'proof': proof, 'pubkey': self.pubkey_pem,'step': 2}
+        K = hkdf_expand(prk, b'', 32, hashlib.sha256)
+        self.session_key = K
+        proof = hmac.new(K, (str(self.A) + str(self.B_server)).encode(), hashlib.sha256).hexdigest()
+        peer_port = self.peer.getsockname()[1]
+        packet = {'type': 'SIGN-IN', 'username': self.username, 'proof': proof, 'pubkey': self.pubkey_pem, 'peer_port': peer_port, 'step': 2}
         response = self.send(packet)
         return response
-    
+
     def verify(self, proof, key) -> bool:
-        expected = hmac.new(key, (str(self.B_server) + str(self.A)).encode(), 
+        expected = hmac.new(key, (str(self.B_server) + str(self.A)).encode(),
                             hashlib.sha256).hexdigest()
         if proof == expected:
             return True
         else:
             return False
-    
+
     def verify_session(self, token):
-        pass
-    
+        try:
+            payload = token['payload'].encode()
+            signature = bytes.fromhex(token['signature'])
+            self.server_pubkey.verify(
+                signature,
+                payload,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            data = json.loads(payload)
+            if int(time.time()) - data['timestamp'] > 3600:
+                return False
+            return True
+        except Exception as e:
+            # print(f"verify_session failed: {e}", flush=True)
+            return False
+
     def list(self):
-        pass
-    
+            pass
+
     def query(self, username):
-        pass
-    
+        packet = {
+            'type': 'QUERY',
+            'token': self.session_token,
+            'target': username
+        }
+        response = self.send(packet)
+        if response and response.get('success'):
+            return response
+        print(f"query fail: {response.get('message') if response else 'no response'}")
+        return None
+
     def p2p(self, username):
-        pass
-    
+        info = self.query(username)
+        if not info:
+            return None
+        peer_ip = info['ip']
+        peer_port = int(info['port'])
+        peer_token = info['token']
+
+        # print(f"queried {username}: ip={peer_ip} port={peer_port}", flush=True)
+
+        if not self.verify_session(peer_token):
+            print(f"Peer {username} has invalid server token")
+            return None
+
+        init_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        init_sock.bind(('0.0.0.0', 0))
+        init_port = init_sock.getsockname()[1]
+
+        eph_priv = X25519PrivateKey.generate()
+        eph_pub = eph_priv.public_key()
+        eph_pub_bytes = eph_pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        init_packet = {
+            'type': 'KEY-INIT',
+            'from': self.username,
+            'eph_pub': eph_pub_bytes.hex(),
+            'token': self.session_token,
+            'init_port': init_port
+        }
+        self.peer.sendto(json.dumps(init_packet).encode(), (peer_ip, peer_port))
+        # print(f"sent KEY-INIT to {peer_ip}:{peer_port}, expecting KEY-RESP on init_port={init_port}", flush=True)
+
+        init_sock.settimeout(5)
+        try:
+            data, _ = init_sock.recvfrom(65535)
+        except socket.timeout:
+            # print(f"timed out waiting for KEY-RESP", flush=True)
+            init_sock.close()
+            return None
+        finally:
+            init_sock.settimeout(None)
+
+        resp = json.loads(data.decode())
+        # print(f"got type={resp.get('type')} on init_sock", flush=True)
+        if resp.get('type') != 'KEY-RESP':
+            print("Unexpected response during key establishment")
+            init_sock.close()
+            return None
+
+        peer_eph_pub_bytes = bytes.fromhex(resp['eph_pub'])
+        peer_sig = bytes.fromhex(resp['sig'])
+        peer_token_resp = resp['token']
+        peer_hs_port = int(resp['hs_port'])
+
+        # print(f"peer hs_port={peer_hs_port}", flush=True)
+
+        if not self.verify_session(peer_token_resp):
+            print("peer token invalid in KEY-RESP")
+            init_sock.close()
+            return None
+
+        peer_payload = json.loads(peer_token_resp['payload'])
+        peer_lt_pubkey = serialization.load_pem_public_key(peer_payload['pubkey'].encode())
+        try:
+            peer_lt_pubkey.verify(
+                peer_sig,
+                eph_pub_bytes + peer_eph_pub_bytes,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        except InvalidSignature:
+            print("peer STS signature invalid")
+            init_sock.close()
+            return None
+
+        # print(f"KEY-RESP verified, sending KEY-ACK+NONCE to hs_port={peer_hs_port}", flush=True)
+
+        our_sig = self.privkey.sign(
+            eph_pub_bytes + peer_eph_pub_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        ack_packet = {'type': 'KEY-ACK', 'from': self.username, 'sig': our_sig.hex()}
+        init_sock.sendto(json.dumps(ack_packet).encode(), (peer_ip, peer_hs_port))
+
+        nonce = secrets.token_bytes(16)
+        init_sock.sendto(
+            json.dumps({'type': 'NONCE', 'nonce': nonce.hex(), 'from': self.username}).encode(),
+            (peer_ip, peer_hs_port)
+        )
+
+        init_sock.settimeout(5)
+        try:
+            data, _ = init_sock.recvfrom(65535)
+        except socket.timeout:
+            # print("timed out waiting for peer NONCE", flush=True)
+            init_sock.close()
+            return None
+        finally:
+            init_sock.settimeout(None)
+
+        peer_nonce = bytes.fromhex(json.loads(data.decode())['nonce'])
+        init_sock.close()
+
+        peer_eph_pub = X25519PublicKey.from_public_bytes(peer_eph_pub_bytes)
+        shared_secret = eph_priv.exchange(peer_eph_pub)
+        prk = hkdf_extract(nonce + peer_nonce, shared_secret, hashlib.sha256)
+        session_key = hkdf_expand(prk, b'session', 32, hashlib.sha256)
+
+        # print(f"session key derived", flush=True)
+        return {'key': session_key, 'ip': peer_ip, 'port': peer_port}
+
+    def handle_key_init(self, packet, addr):
+        sender = packet.get('from')
+        peer_init_port = packet.get('init_port')
+        # print(f"\nhki: sender={sender} addr={addr} init_port={peer_init_port}", flush=True)
+
+        peer_eph_pub_bytes = bytes.fromhex(packet['eph_pub'])
+        peer_token = packet['token']
+
+        if not self.verify_session(peer_token):
+            # print(f"\nhki: verify_session failed for {sender}")
+            return
+
+        hs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        hs_sock.bind(('0.0.0.0', 0))
+        hs_port = hs_sock.getsockname()[1]
+        # print(f"hki: hs_sock bound to port {hs_port}", flush=True)
+
+        eph_priv = X25519PrivateKey.generate()
+        eph_pub = eph_priv.public_key()
+        eph_pub_bytes = eph_pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        our_sig = self.privkey.sign(
+            peer_eph_pub_bytes + eph_pub_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        resp = {
+            'type': 'KEY-RESP',
+            'from': self.username,
+            'eph_pub': eph_pub_bytes.hex(),
+            'token': self.session_token,
+            'sig': our_sig.hex(),
+            'hs_port': hs_port
+        }
+        reply_addr = (addr[0], peer_init_port)
+        hs_sock.sendto(json.dumps(resp).encode(), reply_addr)
+        # print(f"hki: sent KEY-RESP to {reply_addr}", flush=True)
+
+        hs_sock.settimeout(5)
+        try:
+            data, ack_addr = hs_sock.recvfrom(65535)
+            # print(f"hki: got packet on hs_sock from {ack_addr}", flush=True)
+        except socket.timeout:
+            # print(f"\n hki: timed out waiting for KEY-ACK", flush=True)
+            hs_sock.close()
+            return
+        finally:
+            hs_sock.settimeout(None)
+
+        ack = json.loads(data.decode())
+        # print(f"hki: type={ack.get('type')}", flush=True)
+        if ack.get('type') != 'KEY-ACK':
+            # print(f"\nhki: unexpected type={ack.get('type')}")
+            hs_sock.close()
+            return
+
+        peer_payload = json.loads(peer_token['payload'])
+        peer_lt_pubkey = serialization.load_pem_public_key(peer_payload['pubkey'].encode())
+        try:
+            peer_lt_pubkey.verify(
+                bytes.fromhex(ack['sig']),
+                peer_eph_pub_bytes + eph_pub_bytes,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+        except InvalidSignature:
+            # print(f"\nhki: KEY-ACK signature invalid")
+            hs_sock.close()
+            return
+
+        # print(f"hki: KEY-ACK verified, waiting for NONCE", flush=True)
+
+        hs_sock.settimeout(5)
+        try:
+            data, _ = hs_sock.recvfrom(65535)
+        except socket.timeout:
+            # print(f"\nhki: timed out waiting for NONCE", flush=True)
+            hs_sock.close()
+            return
+        finally:
+            hs_sock.settimeout(None)
+
+        nonce_pkt = json.loads(data.decode())
+        peer_nonce = bytes.fromhex(nonce_pkt['nonce'])
+        our_nonce = secrets.token_bytes(16)
+
+        hs_sock.sendto(
+            json.dumps({'type': 'NONCE', 'nonce': our_nonce.hex(), 'from': self.username}).encode(),
+            reply_addr
+        )
+        hs_sock.close()
+
+        peer_eph_pub = X25519PublicKey.from_public_bytes(peer_eph_pub_bytes)
+        shared_secret = eph_priv.exchange(peer_eph_pub)
+        prk = hkdf_extract(peer_nonce + our_nonce, shared_secret, hashlib.sha256)
+        session_key = hkdf_expand(prk, b'session', 32, hashlib.sha256)
+        with self.lock:
+            self.peer_sessions[sender] = session_key
+
+        # print(f"\nhki: session key derived with {sender}", flush=True)
+        print(f"\nSession established with {sender}")
+        print("+> ", end='', flush=True)
+
     def message(self, username, message):
-        pass
-    
+        session = self.p2p(username)
+        if not session:
+            print(f"Could not establish session with {username}")
+            return
+        key = session['key']
+        peer_addr = (session['ip'], session['port'])
+        with self.lock:
+            self.peer_sessions[username] = key
+
+        nonce = secrets.token_bytes(12)
+        ciphertext = AESGCM(key).encrypt(nonce, message.encode(), None)
+        mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).hexdigest()
+        seq = int(time.time())
+
+        packet = {
+            'type': 'MESSAGE',
+            'from': self.username,
+            'seq': seq,
+            'nonce': nonce.hex(),
+            'ciphertext': ciphertext.hex(),
+            'mac': mac
+        }
+        self.peer.sendto(json.dumps(packet).encode(), peer_addr)
+        print(f"Message sent to {username}")
+
     def signout(self):
         pass
 
@@ -226,7 +531,11 @@ if __name__ == "__main__":
     parser.add_argument('--host', type=str, required=True, help='Server host')
     parser.add_argument('--port', type=int, required=True, help='Server port')
     args = parser.parse_args()
-    client = Client(args.username, args.host, args.port)
+
+    with open('server_pubkey.pem', 'rb') as f:
+        server_pubkey = serialization.load_pem_public_key(f.read())
+
+    client = Client(args.username, args.host, args.port, server_pubkey=server_pubkey)
     if args.register:
         password = input("Enter password for registration: ")
         client.register(password)
