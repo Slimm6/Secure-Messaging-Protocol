@@ -20,7 +20,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidSignature
 
-# SRP-6a parameters (same as server)
 n = int("""
     EEAF0AB9ADB38DD69C33F80AFA8FC5E86072618775FF3C0B9EA2314C
     60756745D262E1B0E824D418D00000000000000000000000000000000
@@ -31,10 +30,10 @@ k = int(hashlib.sha256(f"{n}{g}".encode()).hexdigest(), 16)
 
 
 class Client:
-    def __init__(self, username: str, server_host: str, server_port: int, server_pubkey=None):
+    def __init__(self, username, host, port, server_pubkey=None):
         self.username = username
-        self.host = server_host
-        self.port = server_port
+        self.host = host
+        self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.peer.bind(('0.0.0.0', 0))
@@ -137,8 +136,8 @@ class Client:
             hash_len=32,
             type=Type.ID
         )
-        prk = hkdf_extract(bytes.fromhex(salt), hash, hashlib.sha256)
-        x = int.from_bytes(hkdf_expand(prk, b'', 32, hashlib.sha256), byteorder='big')
+        k = hkdf_extract(bytes.fromhex(salt), hash, hashlib.sha256)
+        x = int.from_bytes(hkdf_expand(k, b'', 32, hashlib.sha256), byteorder='big')
         verifier = pow(g, x, n)
         packet = {
             'type': 'REGISTER',
@@ -220,8 +219,8 @@ class Client:
         kgx = (k * pow(g, x, n)) % n
         kgx = (self.B_server - kgx) % n
         secret = pow(kgx, self.a + u * x, n) % n
-        prk = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
-        K = hkdf_expand(prk, b'', 32, hashlib.sha256)
+        prk2 = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
+        K = hkdf_expand(prk2, b'', 32, hashlib.sha256)
         self.session_key = K
         proof = hmac.new(K, (str(self.A) + str(self.B_server)).encode(), hashlib.sha256).hexdigest()
         peer_port = self.peer.getsockname()[1]
@@ -292,7 +291,6 @@ class Client:
         peer_port = int(info['port'])
         peer_token = info['token']
         if not self.verify_session(peer_token):
-            print(f"Peer {username} has invalid server token")
             return None
         init_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         init_sock.bind(('0.0.0.0', 0))
@@ -375,8 +373,8 @@ class Client:
         init_sock.close()
         peer_eph_pub = X25519PublicKey.from_public_bytes(peer_eph_pub_bytes)
         shared_secret = eph_priv.exchange(peer_eph_pub)
-        prk = hkdf_extract(nonce + peer_nonce, shared_secret, hashlib.sha256)
-        session_key = hkdf_expand(prk, b'session', 32, hashlib.sha256)
+        k = hkdf_extract(nonce + peer_nonce, shared_secret, hashlib.sha256)
+        session_key = hkdf_expand(k, b'session', 32, hashlib.sha256)
         return {'key': session_key, 'ip': peer_ip, 'port': peer_port}
 
     def handle_key_init(self, packet, addr):
@@ -458,11 +456,10 @@ class Client:
         hs_sock.close()
         peer_eph_pub = X25519PublicKey.from_public_bytes(peer_eph_pub_bytes)
         shared_secret = eph_priv.exchange(peer_eph_pub)
-        prk = hkdf_extract(peer_nonce + our_nonce, shared_secret, hashlib.sha256)
-        session_key = hkdf_expand(prk, b'session', 32, hashlib.sha256)
+        k = hkdf_extract(peer_nonce + our_nonce, shared_secret, hashlib.sha256)
+        session_key = hkdf_expand(k, b'session', 32, hashlib.sha256)
         with self.lock:
             self.peer_sessions[sender] = session_key
-        print(f"\nSession established with {sender}")
         print("+> ", end='', flush=True)
 
     def message(self, username, message):

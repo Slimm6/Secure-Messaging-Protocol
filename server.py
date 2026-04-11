@@ -111,13 +111,12 @@ class Server:
             verifier = user['verifier']
             salt = user['salt']
             if step == 1:
-                client_public_A = int(packet.get('A'))
                 b = secrets.randbelow(n)
-                server_public_B = (k * verifier + pow(g, b, n)) % n
+                B = (k * verifier + pow(g, b, n)) % n
                 self.clients[username] = {
                     'b': b,
-                    'A': client_public_A,
-                    'B': server_public_B,
+                    'A': int(packet.get('A')),
+                    'B': B,
                     'verifier': verifier,
                     'addr': addr
                 }
@@ -125,7 +124,7 @@ class Server:
                     'type': 'SIGN-IN-RESP',
                     'step': 2,
                     'salt': salt,
-                    'B': str(server_public_B)
+                    'B': str(B)
                 }
                 self.sock.sendto(json.dumps(response).encode(), addr)
             elif step == 2:
@@ -138,16 +137,15 @@ class Server:
                 A = session['A']
                 B = session['B']
                 u = int(hashlib.sha256(f"{A}{B}".encode()).hexdigest(), 16)
-                server_secret = pow(A * pow(verifier, u, n), session['b'], n) % n
-                salt_bytes = bytes.fromhex(salt)
-                prk = hkdf_extract(salt_bytes, server_secret.to_bytes(256, 'big'), hashlib.sha256)
+                secret = pow(A * pow(verifier, u, n), session['b'], n) % n
+                prk = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
                 K = hkdf_expand(prk, b'', 32, hashlib.sha256)
                 expected = hmac.new(K, (str(A) + str(B)).encode(), hashlib.sha256).hexdigest()
                 if proof == expected:
                     client_pubkey = packet.get('pubkey')
-                    peer_port = packet.get('peer_port', addr[1])
-                    self.clients[username] = {'ip': addr[0], 'port': peer_port}
-                    print(f"Client {username} registered: {addr[0]}:{peer_port}")
+                    port = packet.get('peer_port', addr[1])
+                    self.clients[username] = {'ip': addr[0], 'port':port}
+                    print(f"Client {username} registered: {addr[0]}:{port}")
                     proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()
                     token = self.create_token(username, client_pubkey)
                     self.sessions[username] = token
