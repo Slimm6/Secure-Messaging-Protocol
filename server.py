@@ -101,64 +101,89 @@ class Server:
 
     def authenticate(self, packet, addr):
         username = packet.get('username')
-        step = packet.get('step', 1)
+        step = packet.get('step', 'calculate')
         with self.lock:
             if username not in self.users:
                 response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'User not found'}
                 self.sock.sendto(json.dumps(response).encode(), addr)
                 return
+        if step == 'calculate':
+            self.calculate_B(username, packet, addr)
+        elif step == 'verify':
+            self.hmac_verification(username, packet, addr)
+
+    def calculate_B(self, username, packet, addr):
+        with self.lock:
             user = self.users[username]
             verifier = user['verifier']
             salt = user['salt']
-            if step == 1:
-                b = secrets.randbelow(n)
-                B = (k * verifier + pow(g, b, n)) % n
-                self.clients[username] = {
-                    'b': b,
-                    'A': int(packet.get('A')),
-                    'B': B,
-                    'verifier': verifier,
-                    'addr': addr
-                }
-                response = {
-                    'type': 'SIGN-IN-RESP',
-                    'step': 2,
-                    'salt': salt,
-                    'B': str(B)
-                }
+            b = secrets.randbelow(n)
+            B = (k * verifier + pow(g, b, n)) % n
+            self.clients[username] = {
+                'b': b,
+                'A': int(packet.get('A')),
+                'B': B,
+                'verifier': verifier,
+                'addr': addr
+            }
+            response = {
+                'type': 'SIGN-IN-RESP',
+                'step': 'verify',
+                'salt': salt,
+                'B': str(B)
+            }
+            self.sock.sendto(json.dumps(response).encode(), addr)
+
+    def hmac_verification(self, username, packet, addr):
+        proof = packet.get('proof')
+        with self.lock:
+            if username not in self.clients:
+                response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication session expired'}
                 self.sock.sendto(json.dumps(response).encode(), addr)
-            elif step == 2:
-                proof = packet.get('proof')
-                if username not in self.clients:
-                    response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication session expired'}
-                    self.sock.sendto(json.dumps(response).encode(), addr)
-                    return
-                session = self.clients[username]
+                return 
+            user = self.users[username]
+            salt = user['salt']
+            session = self.clients[username]
+            valid, K = self.verify(session, salt, proof)
+            if valid:
+                client_pubkey = packet.get('pubkey')
+                peer_port = packet.get('peer_port', addr[1])
+                self.clients[username] = {'ip': addr[0], 'port': peer_port}
+                print(f"Client {username} registered: {addr[0]}:{peer_port}")                
                 A = session['A']
                 B = session['B']
-                u = int(hashlib.sha256(f"{A}{B}".encode()).hexdigest(), 16)
-                secret = pow(A * pow(verifier, u, n), session['b'], n) % n
-                prk = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
-                K = hkdf_expand(prk, b'', 32, hashlib.sha256)
-                expected = hmac.new(K, (str(A) + str(B)).encode(), hashlib.sha256).hexdigest()
-                if proof == expected:
-                    client_pubkey = packet.get('pubkey')
-                    port = packet.get('peer_port', addr[1])
-                    self.clients[username] = {'ip': addr[0], 'port':port}
-                    print(f"Client {username} registered: {addr[0]}:{port}")
-                    proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()
-                    token = self.create_token(username, client_pubkey)
-                    self.sessions[username] = token
-                    response = {
-                        'type': 'SIGN-IN-RESP',
-                        'success': True,
-                        'proof': proof,
-                        'token': token,
-                        'message': 'Authentication successful'
-                    }
-                else:
-                    response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
-                self.sock.sendto(json.dumps(response).encode(), addr)
+                server_proof = hmac.new(K, (str(B) + str(A)).encode(), hashlib.sha256).hexdigest()                
+                token = self.create_token(username, client_pubkey)
+                self.sessions[username] = token
+                response = {
+                    'type': 'SIGN-IN-RESP',
+                    'success': True,
+                    'proof': server_proof,
+                    'token': token,
+                    'message': 'Authentication successful'
+                }
+            else:
+                response = {'type': 'SIGN-IN-RESP', 'success': False, 'message': 'Authentication failed'}
+            self.sock.sendto(json.dumps(response).encode(), addr)
+
+    def verify(self, session, salt, proof):
+        try:
+            A = session['A']
+            B = session['B']
+            verifier = session['verifier']
+            b = session['b']
+            u = int(hashlib.sha256(f"{A}{B}".encode()).hexdigest(), 16)
+            secret = pow(A * pow(verifier, u, n), b, n) % n
+            prk = hkdf_extract(bytes.fromhex(salt), secret.to_bytes(256, 'big'), hashlib.sha256)
+            K = hkdf_expand(prk, b'', 32, hashlib.sha256)
+            expected = hmac.new(K, (str(A) + str(B)).encode(), hashlib.sha256).hexdigest()
+            if proof == expected:
+                return True, K
+            else:
+                return False, None
+        except Exception as e:
+            print(f"Error verifying auth proof: {e}")
+            return False, None
 
     def create_token(self, username, client_pubkey):
         timestamp = int(time.time())
@@ -198,8 +223,8 @@ class Server:
 
     def list(self, packet, addr):
         token = packet.get('token')
-        is_valid, token_data = self.verify_token(token)
-        if not is_valid:
+        valid, token_data = self.verify_token(token)
+        if not valid:
             self.sock.sendto(json.dumps({'type': 'LIST-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
         username = token_data.get('username')
@@ -217,8 +242,8 @@ class Server:
 
     def signout(self, packet, username, addr):
         token = packet.get('token')
-        is_valid, token_data = self.verify_token(token)
-        if not is_valid:
+        valid, token_data = self.verify_token(token)
+        if not valid:
             self.sock.sendto(json.dumps({'type': 'SIGNOUT-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
         with self.lock:
@@ -235,8 +260,8 @@ class Server:
     def query(self, packet, addr):
         token = packet.get('token')
         target = packet.get('target')
-        is_valid, token_data = self.verify_token(token)
-        if not is_valid:
+        valid, token_data = self.verify_token(token)
+        if not valid:
             self.sock.sendto(json.dumps({'type': 'QUERY-RESP', 'success': False, 'message': 'invalid or expired token'}).encode(), addr)
             return
         username = token_data.get('username')

@@ -5,7 +5,7 @@ import socket
 import threading
 import json
 import hashlib
-from typing import Dict, Optional
+from typing import Dict
 import secrets
 import hmac
 from urllib import response
@@ -81,8 +81,12 @@ class Client:
                     else:
                         print(f"Unknown command: '{command}'")
                 except KeyboardInterrupt:
+                    self.signout()
+                    self.sock.close()
                     break
                 except Exception as e:
+                    self.signout()
+                    self.sock.close()
                     print(f"Error: {e}")
         except KeyboardInterrupt:
             self.sock.close()
@@ -153,27 +157,27 @@ class Client:
             return False
 
     def login(self, password):
-        step1 = self.signin(password)
-        if not step1:
+        calculate = self.signin(password)
+        if not calculate:
             print("Login failed: No response from server")
             return False
-        step2 = self.send_hmac(password, step1)
-        if not step2:
+        verify = self.send_hmac(password, calculate)
+        if not verify:
             print("Login failed: HMAC error")
             return False
-        if step2.get('success'):
-            proof = step2.get('proof')
+        if verify.get('success'):
+            proof = verify.get('proof')
             if not self.verify(proof, self.session_key):
                 print("Login failed: verification failed")
                 return False
-            self.session_token = step2.get('token')
+            self.session_token = verify.get('token')
             print("Authentication successful!")
             return True
         else:
-            print(f"Login failed: {step2.get('message', 'Unknown error')}")
+            print(f"Login failed: {verify.get('message', 'Unknown error')}")
             return False
 
-    def send(self, packet: Dict):
+    def send(self, packet):
         try:
             self.sock.sendto(json.dumps(packet).encode(), (self.host, self.port))
             self.sock.settimeout(5)
@@ -194,10 +198,10 @@ class Client:
             'type': 'SIGN-IN',
             'username': self.username,
             'A': str(self.A),
-            'step': 1
+            'step': 'calculate'
         }
         response = self.send(packet)
-        if response and response.get('step') == 2:
+        if response and response.get('step') == 'verify':
             return response
         return None
 
@@ -224,7 +228,7 @@ class Client:
         self.session_key = K
         proof = hmac.new(K, (str(self.A) + str(self.B_server)).encode(), hashlib.sha256).hexdigest()
         peer_port = self.peer.getsockname()[1]
-        packet = {'type': 'SIGN-IN', 'username': self.username, 'proof': proof, 'pubkey': self.pubkey_pem, 'peer_port': peer_port, 'step': 2}
+        packet = {'type': 'SIGN-IN', 'username': self.username, 'proof': proof, 'pubkey': self.pubkey_pem, 'peer_port': peer_port, 'step': 'verify'}
         response = self.send(packet)
         return response
 
